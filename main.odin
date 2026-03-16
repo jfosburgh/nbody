@@ -1,13 +1,15 @@
-package nbody
+package main
 
 import "core:log"
 import "core:math"
 import glm "core:math/linalg"
 import "core:math/rand"
 import "core:mem"
+import "core:thread"
+import "core:time"
 import dial "shared:dial"
 
-N_BODIES :: 100
+N_BODIES :: 1000
 
 Particle :: struct {
 	pos:   [3]f32,
@@ -21,10 +23,27 @@ particles: #soa[N_BODIES]Particle
 VERTEX_SHADER :: "assets/shaders/particle.vert.spv"
 FRAGMENT_SHADER :: "assets/shaders/particle.frag.spv"
 
-G :: 10
+G :: 1000
 EPS :: 10
 
+calculate_force :: proc(m1, m2: f32, p1, p2: [3]f32) -> [3]f32 {
+	diff := p2 - p1
+	dist_sq := glm.dot(diff, diff) + EPS
+
+	dist_inv := 1 / math.sqrt(dist_sq)
+	dist_inv_cube := dist_inv * dist_inv * dist_inv
+
+	return diff * G * m1 * m2 * dist_inv_cube
+}
+
 naive_force :: proc(particles: #soa[]Particle) {
+	now := time.now()
+	defer log.debugf(
+		"Naive force calculated for %d bodies in %.2fms",
+		len(particles),
+		time.duration_milliseconds(time.since(now)),
+	)
+
 	for i in 0 ..< len(particles) {
 		pos_i := particles.pos[i]
 		mass_i := particles.mass[i]
@@ -32,19 +51,70 @@ naive_force :: proc(particles: #soa[]Particle) {
 			pos_j := particles.pos[j]
 			mass_j := particles.mass[j]
 
-			diff := pos_j - pos_i
-			dist_sq := glm.dot(diff, diff) + EPS
-
-			dist_inv := 1 / math.sqrt(dist_sq)
-			dist_inv_cube := dist_inv * dist_inv * dist_inv
-
-			force := diff * G * mass_i * mass_j * dist_inv_cube
+			force := calculate_force(mass_i, mass_j, pos_i, pos_j)
 
 			particles.accel[:][i] += force
 			particles.accel[:][j] -= force
 		}
 	}
 }
+
+threaded_force :: proc(
+	particles: #soa[]Particle,
+	thread_count: int,
+	allocator := context.allocator,
+) {
+	now := time.now()
+	defer log.debugf(
+		"Threaded naive force calculated for %d bodies in %.2fms",
+		len(particles),
+		time.duration_milliseconds(time.since(now)),
+	)
+
+	pool: thread.Pool
+	thread.pool_init(&pool, allocator, thread_count)
+	thread.pool_start(&pool)
+
+	TaskData :: struct {
+		particles:   #soa[]Particle,
+		start, stop: int,
+	}
+
+	tasks := make([]TaskData, thread_count, allocator)
+
+	task_handler :: proc(task: thread.Task) {
+		data := cast(^TaskData)task.data
+		stop := min(data.stop, len(particles))
+		for i in data.start ..< stop {
+			pos_i := particles.pos[i]
+			mass_i := particles.mass[i]
+			for j in 0 ..< len(particles) {
+				if i == j do continue
+				pos_j := particles.pos[j]
+				mass_j := particles.mass[j]
+
+				particles.accel[:][i] += calculate_force(mass_i, mass_j, pos_i, pos_j)
+			}
+		}
+	}
+
+	n_per_task := len(particles) / thread_count + 1
+
+	for index in 0 ..< thread_count {
+		task_data := &tasks[index]
+		task_data.particles = particles
+		task_data.start = index * n_per_task
+		task_data.stop = (index + 1) * n_per_task
+
+		thread.pool_add_task(&pool, mem.nil_allocator(), task_handler, task_data, index)
+	}
+
+	thread.pool_finish(&pool)
+	delete(tasks)
+	thread.pool_destroy(&pool)
+}
+
+barnes_hut_force :: proc(particles: #soa[]Particle)
 
 update_particles :: proc(particles: #soa[]Particle, dt: f32) {
 	for &p in particles {
@@ -109,8 +179,9 @@ main :: proc() {
 		camera:    rawptr,
 	}
 
+	center_mass: f32 = 1000
 	particles[0] = {
-		mass = 10000,
+		mass = center_mass,
 	}
 	for i in 1 ..< N_BODIES {
 		angle := rand.float32_range(0, glm.PI * 2)
@@ -125,7 +196,7 @@ main :: proc() {
 
 		dir := glm.normalize([2]f32{dir_x, dir_y})
 
-		speed := math.sqrt((G * 10000) / d)
+		speed := math.sqrt((G * center_mass) / d)
 		particles.vel[i] = {dir.x * speed, dir.y * speed, 0}
 		particles.mass[i] = 1
 	}
@@ -134,7 +205,16 @@ main :: proc() {
 		rtb: dial.RenderTargetBuilder
 		defer dial.rtb_clear(&rtb)
 
-		half_size: f32 = 500.
+		// naive_force(particles[:])
+		threaded_force(particles[:], 8)
+		update_particles(particles[:], dial.delta())
+
+		half_size: f32
+		for p in particles {
+			half_size = max(half_size, max(abs(p.pos.x), abs(p.pos.y)))
+		}
+		half_size += 10
+
 		camera: CameraData = {
 			view = glm.matrix4_look_at_f32({0, 0, -10}, {0, 0, 0}, {0, 1, 0}),
 			proj = glm.matrix_ortho3d_f32(
@@ -147,8 +227,6 @@ main :: proc() {
 			),
 		}
 
-		naive_force(particles[:])
-		update_particles(particles[:], dial.delta())
 		mem.copy(rawptr(&gpu_pos.cpu[0]), rawptr(&particles.pos), size_of([3]f32) * N_BODIES)
 		camera_data.cpu^ = camera
 
@@ -161,6 +239,19 @@ main :: proc() {
 
 			dial.rtb_set_color_target(&rtb, swapchain, {})
 			if dial.begin_rendering(buf, dial.rtb_build_render_pass_desc(&rtb)) {
+				dial.set_blend_state(
+					buf,
+					{
+						enable = true,
+						alpha_op = .Max,
+						color_op = .Add,
+						src_color_factor = .One,
+						dst_color_factor = .One_Minus_Src_Alpha,
+						src_alpha_factor = .One,
+						dst_alpha_factor = .One,
+						color_write_mask = {.R, .G, .B, .A},
+					},
+				)
 				dial.set_shaders(buf, vertex_shader, fragment_shader)
 				dial.draw_instanced(buf, instance_data, {}, 6, N_BODIES)
 			}

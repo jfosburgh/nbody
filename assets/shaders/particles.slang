@@ -54,8 +54,8 @@ VertexOutput vertexMain(
 [shader("fragment")]
 float4 fragmentMain(VertexOutput input, GraphicsPipelineData<InstanceData> pipeline) : SV_Target
 {
-    float d = length(input.uv) - 1.0;
-    float alpha = 1.0 - smoothstep(-0.01, 0.01, d);
+    float d = length(input.uv);
+    float alpha = 1.0 - d;
 
     return input.color * alpha;
 }
