@@ -1,16 +1,14 @@
 import "shared.slang";
 
-struct CircleMaterial {
-    float3 center;
-}
-
 struct CameraData {
 	column_major float4x4 view;
 	column_major float4x4 proj;
 }
 
 struct InstanceData {
-    CircleMaterial* instances;
+    float* x;
+    float* y;
+    float* z;
 	CameraData* camera;
 }
 
@@ -29,7 +27,7 @@ VertexOutput vertexMain(
     VertexOutput vert_out;
     float radius = 5.0;
     
-    CircleMaterial mat = pipeline.vert->instances[inst_id];
+    float3 center = float3(pipeline.vert->x[inst_id], pipeline.vert->y[inst_id], pipeline.vert->z[inst_id]);
     CameraData* cam = pipeline.vert->camera;
 
     float2 corners[4] = {
@@ -39,7 +37,7 @@ VertexOutput vertexMain(
     uint quad_indices[6] = { 0, 2, 1, 1, 2, 3 };
     float2 offset = corners[quad_indices[vert_id % 6]];
 
-    float4 viewCenter = mul(cam->view, float4(mat.center, 1.0));
+    float4 viewCenter = mul(cam->view, float4(center, 1.0));
     
     float4 viewPos = viewCenter + float4(offset * radius, 0.0, 0.0);
 

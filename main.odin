@@ -2,125 +2,196 @@ package main
 
 import "core:log"
 import "core:math"
-import glm "core:math/linalg"
+import "core:math/linalg"
 import "core:math/rand"
 import "core:mem"
-import "core:thread"
-import "core:time"
 import dial "shared:dial"
+import nbody "src"
 
-N_BODIES :: 1000
+N_BODIES :: 8000
+G :: 100
+EPS :: 10
 
-Particle :: struct {
-	pos:   [3]f32,
-	vel:   [3]f32,
-	accel: [3]f32,
-	mass:  f32,
-}
-
-particles: #soa[N_BODIES]Particle
+// INVALID_NODE :: -1
+// INVALID_PARTICLE :: -1
+//
+// Node :: struct {
+// 	center_of_mass:  [3]f32,
+// 	total_mass:      f32,
+// 	first_child_idx: i32,
+// 	particle_count:  u32,
+// 	particle_idx:    i32,
+// 	child_mask:      u8,
+// 	depth:           u8,
+// 	_reserved:       [2]u8,
+// }
+//
+// Octree :: struct {
+// 	nodes:      [dynamic]Node,
+// 	particles:  ^#soa[]Particle,
+// 	center:     [3]f32,
+// 	half_width: f32,
+// }
+//
+// get_octant_index :: #force_inline proc(center: [3]f32, pos: [3]f32) -> int {
+// 	index := 0
+// 	if pos.x >= center.x do index |= 1 // Bit 0: X-axis
+// 	if pos.y >= center.y do index |= 2 // Bit 1: Y-axis
+// 	if pos.z >= center.z do index |= 4 // Bit 2: Z-axis
+// 	return index
+// }
+//
+// get_child_center :: #force_inline proc(
+// 	parent_center: [3]f32,
+// 	parent_half_width: f32,
+// 	octant: int,
+// ) -> [3]f32 {
+// 	half_width := parent_half_width * 0.5
+// 	return {
+// 		parent_center.x + (octant & 1 != 0 ? half_width : -half_width),
+// 		parent_center.y + (octant & 2 != 0 ? half_width : -half_width),
+// 		parent_center.z + (octant & 4 != 0 ? half_width : -half_width),
+// 	}
+// }
+//
+// octree_init :: proc(
+// 	t: ^Octree,
+// 	particles: ^#soa[]Particle,
+// 	center: [3]f32,
+// 	half_width: f32,
+// 	allocator := context.allocator,
+// 	loc := #caller_location,
+// ) {
+// 	t.center = center
+// 	t.half_width = half_width
+// 	t.particles = particles
+// 	t.nodes = make([dynamic]Node, 1, allocator, loc)
+// 	t.nodes[0].particle_idx = INVALID_PARTICLE
+// 	t.nodes[0].first_child_idx = INVALID_NODE
+// }
+//
+// octree_reset :: proc(t: ^Octree, center: [3]f32, half_width: f32) {
+// 	clear(&t.nodes)
+//
+// 	t.center = center
+// 	t.half_width = half_width
+//
+// 	append(&t.nodes, Node{particle_idx = INVALID_PARTICLE, first_child_idx = INVALID_NODE})
+// }
+//
+// octree_destroy :: proc(t: ^Octree) {
+// 	delete(t.nodes)
+// 	t^ = {}
+// }
+//
+// octree_insert :: proc(t: ^Octree, particle: i32) {
+// 	octree_insert_recursive(t, 0, particle, t.center, t.half_width)
+// }
+//
+// @(private)
+// octree_insert_recursive :: proc(
+// 	t: ^Octree,
+// 	node_index, particle_index: i32,
+// 	center: [3]f32,
+// 	half_width: f32,
+// ) {
+// 	// Shared updates
+// 	node := &t.nodes[node_index]
+// 	node.particle_count += 1
+//
+// 	new_particle := &t.particles[particle_index]
+// 	old_mass := node.total_mass
+// 	node.total_mass += new_particle.mass
+// 	for i in 0 ..< 3 {
+// 		node.center_of_mass[i] =
+// 			(node.center_of_mass[i] * old_mass + new_particle.pos[i] * new_particle.mass) /
+// 			node.total_mass
+// 	}
+//
+// 	// Empty node -- insert in place
+// 	if node.particle_idx == INVALID_PARTICLE && node.first_child_idx == INVALID_NODE {
+// 		node.particle_idx = particle_index
+// 		return
+// 	}
+//
+// 	// Leaf node -- subdivide, insert old, insert new
+// 	if node.particle_idx != INVALID_PARTICLE {
+// 		first_child := i32(len(t.nodes))
+// 		reserve(&t.nodes, len(t.nodes) + 8)
+// 		for i in 0 ..< 8 {
+// 			t.nodes[int(first_child) + i] = {
+// 				particle_idx    = INVALID_PARTICLE,
+// 				first_child_idx = INVALID_NODE,
+// 				depth           = node.depth + 1,
+// 			}
+// 		}
+//
+// 		node = &t.nodes[node_index]
+// 		replace_octant := get_octant_index(center, t.particles[node.particle_idx].pos)
+// 	}
+// }
 
 VERTEX_SHADER :: "assets/shaders/particle.vert.spv"
 FRAGMENT_SHADER :: "assets/shaders/particle.frag.spv"
 
-G :: 1000
-EPS :: 10
+// Constants for stability
+CENTRAL_MASS :: 50_000.0
+PARTICLE_MASS :: 0.1
+INNER_RADIUS :: 50.0
+OUTER_RADIUS :: 1000.0
 
-calculate_force :: proc(m1, m2: f32, p1, p2: [3]f32) -> [3]f32 {
-	diff := p2 - p1
-	dist_sq := glm.dot(diff, diff) + EPS
+init_stable_disk :: proc(particles: #soa[]nbody.Particle) {
+	// 1. Anchor the center
+	particles.px[:][0], particles.py[:][0], particles.pz[:][0] = 0, 0, 0
+	particles.vx[:][0], particles.vy[:][0], particles.vz[:][0] = 0, 0, 0
+	particles.mass[:][0] = CENTRAL_MASS
 
-	dist_inv := 1 / math.sqrt(dist_sq)
-	dist_inv_cube := dist_inv * dist_inv * dist_inv
+	for i in 1 ..< len(particles) {
+		// Distribute radius using square root for uniform disk density
+		// Otherwise, particles clump too much at the center
+		r := INNER_RADIUS + (math.sqrt(rand.float32()) * (OUTER_RADIUS - INNER_RADIUS))
+		angle := rand.float32() * math.TAU
 
-	return diff * G * m1 * m2 * dist_inv_cube
-}
+		px := math.cos(angle) * r
+		py := math.sin(angle) * r
 
-naive_force :: proc(particles: #soa[]Particle) {
-	now := time.now()
-	defer log.debugf(
-		"Naive force calculated for %d bodies in %.2fms",
-		len(particles),
-		time.duration_milliseconds(time.since(now)),
-	)
+		particles.px[:][i] = px
+		particles.py[:][i] = py
+		particles.pz[:][i] = rand.float32_range(-2, 2) // Tiny bit of vertical jitter
 
-	for i in 0 ..< len(particles) {
-		pos_i := particles.pos[i]
-		mass_i := particles.mass[i]
-		for j in i + 1 ..< len(particles) {
-			pos_j := particles.pos[j]
-			mass_j := particles.mass[j]
+		// 2. Calculate stable orbital velocity considering softening (EPS)
+		// Force with softening: F = G*M*r / (r^2 + EPS)^1.5
+		// Set Centripetal Force (mv^2/r) equal to Gravitational Force
+		r_sq := r * r
+		denom := math.pow(r_sq + EPS, 1.5)
+		speed := math.sqrt((G * CENTRAL_MASS * r_sq) / denom)
 
-			force := calculate_force(mass_i, mass_j, pos_i, pos_j)
+		// 3. Tangential velocity (perpendicular to position vector)
+		dir_x := -py / r
+		dir_y := px / r
 
-			particles.accel[:][i] += force
-			particles.accel[:][j] -= force
-		}
+		// Add a tiny bit of random dispersion (5%) so it's not a "perfect" crystal
+		dispersion := 1.0 + rand.float32_range(-0.05, 0.05)
+
+		particles.vx[:][i] = dir_x * speed * dispersion
+		particles.vy[:][i] = dir_y * speed * dispersion
+		particles.vz[:][i] = rand.float32_range(-0.1, 0.1)
+
+		particles.mass[:][i] = PARTICLE_MASS
 	}
 }
 
-threaded_force :: proc(
-	particles: #soa[]Particle,
-	thread_count: int,
-	allocator := context.allocator,
-) {
-	now := time.now()
-	defer log.debugf(
-		"Threaded naive force calculated for %d bodies in %.2fms",
-		len(particles),
-		time.duration_milliseconds(time.since(now)),
-	)
-
-	pool: thread.Pool
-	thread.pool_init(&pool, allocator, thread_count)
-	thread.pool_start(&pool)
-
-	TaskData :: struct {
-		particles:   #soa[]Particle,
-		start, stop: int,
-	}
-
-	tasks := make([]TaskData, thread_count, allocator)
-
-	task_handler :: proc(task: thread.Task) {
-		data := cast(^TaskData)task.data
-		stop := min(data.stop, len(particles))
-		for i in data.start ..< stop {
-			pos_i := particles.pos[i]
-			mass_i := particles.mass[i]
-			for j in 0 ..< len(particles) {
-				if i == j do continue
-				pos_j := particles.pos[j]
-				mass_j := particles.mass[j]
-
-				particles.accel[:][i] += calculate_force(mass_i, mass_j, pos_i, pos_j)
-			}
-		}
-	}
-
-	n_per_task := len(particles) / thread_count + 1
-
-	for index in 0 ..< thread_count {
-		task_data := &tasks[index]
-		task_data.particles = particles
-		task_data.start = index * n_per_task
-		task_data.stop = (index + 1) * n_per_task
-
-		thread.pool_add_task(&pool, mem.nil_allocator(), task_handler, task_data, index)
-	}
-
-	thread.pool_finish(&pool)
-	delete(tasks)
-	thread.pool_destroy(&pool)
-}
-
-barnes_hut_force :: proc(particles: #soa[]Particle)
-
-update_particles :: proc(particles: #soa[]Particle, dt: f32) {
+update_particles :: proc(particles: #soa[]nbody.Particle, dt: f32) {
 	for &p in particles {
-		p.vel += p.accel * dt / p.mass
-		p.pos += p.vel * dt
-		p.accel = {}
+		p.vx += p.ax * dt / p.mass
+		p.vy += p.ay * dt / p.mass
+		p.vz += p.az * dt / p.mass
+		p.px += p.vx * dt
+		p.py += p.vy * dt
+		p.pz += p.vz * dt
+		p.ax = 0
+		p.ay = 0
+		p.az = 0
 	}
 }
 
@@ -171,53 +242,36 @@ main :: proc() {
 	CameraData :: struct {
 		view, proj: matrix[4, 4]f32,
 	}
-	gpu_pos := dial.create_shared_memory([3]f32, N_BODIES)
+	gpu_px := dial.create_shared_memory(f32, N_BODIES)
+	gpu_py := dial.create_shared_memory(f32, N_BODIES)
+	gpu_pz := dial.create_shared_memory(f32, N_BODIES)
 	camera_data := dial.create_shared_memory(CameraData)
 
 	InstanceData :: struct {
-		instances: rawptr,
-		camera:    rawptr,
+		x, y, z: rawptr,
+		camera:  rawptr,
 	}
 
-	center_mass: f32 = 1000
-	particles[0] = {
-		mass = center_mass,
-	}
-	for i in 1 ..< N_BODIES {
-		angle := rand.float32_range(0, glm.PI * 2)
-		d := rand.float32_range(20, 450)
+	particles := make(#soa[]nbody.Particle, N_BODIES)
+	defer delete(particles)
 
-		px := math.cos(angle) * d
-		py := math.sin(angle) * d
-		particles.pos[i] = {px, py, 0}
-
-		dir_x := -py
-		dir_y := px
-
-		dir := glm.normalize([2]f32{dir_x, dir_y})
-
-		speed := math.sqrt((G * center_mass) / d)
-		particles.vel[i] = {dir.x * speed, dir.y * speed, 0}
-		particles.mass[i] = 1
-	}
+	init_stable_disk(particles)
 
 	for !dial.should_quit() {
+		dt := dial.delta()
+		log.infof("frame completed in %.0fms", dial.delta() * 1000)
+
 		rtb: dial.RenderTargetBuilder
 		defer dial.rtb_clear(&rtb)
 
-		// naive_force(particles[:])
-		threaded_force(particles[:], 8)
-		update_particles(particles[:], dial.delta())
+		nbody.naive_force_soa_simd_threaded(particles[:], 8, G, EPS)
+		update_particles(particles[:], dt)
 
-		half_size: f32
-		for p in particles {
-			half_size = max(half_size, max(abs(p.pos.x), abs(p.pos.y)))
-		}
-		half_size += 10
+		half_size: f32 = OUTER_RADIUS * 1.05
 
 		camera: CameraData = {
-			view = glm.matrix4_look_at_f32({0, 0, -10}, {0, 0, 0}, {0, 1, 0}),
-			proj = glm.matrix_ortho3d_f32(
+			view = linalg.matrix4_look_at_f32({0, 0, -10}, {0, 0, 0}, {0, 1, 0}),
+			proj = linalg.matrix_ortho3d_f32(
 				-half_size,
 				half_size,
 				half_size,
@@ -227,14 +281,18 @@ main :: proc() {
 			),
 		}
 
-		mem.copy(rawptr(&gpu_pos.cpu[0]), rawptr(&particles.pos), size_of([3]f32) * N_BODIES)
+		mem.copy(rawptr(&gpu_px.cpu[0]), rawptr(&particles.px[0]), size_of(f32) * N_BODIES)
+		mem.copy(rawptr(&gpu_py.cpu[0]), rawptr(&particles.py[0]), size_of(f32) * N_BODIES)
+		mem.copy(rawptr(&gpu_pz.cpu[0]), rawptr(&particles.pz[0]), size_of(f32) * N_BODIES)
 		camera_data.cpu^ = camera
 
 		if swapchain, frame_arena, buf, ok := dial.frame_prepare(); ok {
 			instance_data := dial.create_shared_frame_memory(InstanceData, frame_arena)
 			instance_data.cpu^ = {
-				instances = gpu_pos.gpu.ptr,
-				camera    = camera_data.gpu.ptr,
+				x      = gpu_px.gpu.ptr,
+				y      = gpu_py.gpu.ptr,
+				z      = gpu_pz.gpu.ptr,
+				camera = camera_data.gpu.ptr,
 			}
 
 			dial.rtb_set_color_target(&rtb, swapchain, {})
