@@ -1,11 +1,14 @@
 package nbody
 
+import "base:runtime"
 import "core:fmt"
 import "core:math"
 import "core:math/linalg"
 import "core:math/rand"
 import "core:mem"
 import "core:simd"
+import "core:sync"
+import "core:sys/info"
 import "core:thread"
 import "core:time"
 
@@ -90,25 +93,25 @@ naive_force_soa :: proc(particles: #soa[]Particle, g: f32 = G, eps: f32 = EPS) {
 
 naive_force_soa_threaded :: proc(
 	particles: #soa[]Particle,
-	threads := 8,
 	g: f32 = G,
 	eps: f32 = EPS,
 	allocator := context.allocator,
 ) {
-	pool: thread.Pool
-	thread.pool_init(&pool, allocator, threads)
-	thread.pool_start(&pool)
-
 	TaskData :: struct {
 		particles:   #soa[]Particle,
 		start, stop: int,
 		g, eps:      f32,
+		wg:          ^sync.Wait_Group,
 	}
 
-	tasks := make([]TaskData, threads, allocator)
+	n_tasks := min(len(global_pool.threads) * THREAD_MULT, len(particles) / WIDTH)
+	tasks := make([]TaskData, n_tasks, allocator)
+	defer delete(tasks)
 
 	task_handler :: proc(task: thread.Task) {
 		data := cast(^TaskData)task.data
+		defer sync.wait_group_done(data.wg)
+
 		particles := data.particles
 		stop := min(data.stop, len(particles))
 		for i in data.start ..< stop {
@@ -133,26 +136,33 @@ naive_force_soa_threaded :: proc(
 		}
 	}
 
-	n_per_task := len(particles) / threads + 1
+	n_per_task := len(particles) / n_tasks + 1
 
-	for index in 0 ..< threads {
+	wg: sync.Wait_Group
+	sync.wait_group_add(&wg, n_tasks)
+
+	for index in 0 ..< n_tasks {
 		task_data := &tasks[index]
 		task_data.particles = particles
 		task_data.start = index * n_per_task
 		task_data.stop = (index + 1) * n_per_task
 		task_data.g = g
 		task_data.eps = eps
+		task_data.wg = &wg
 
-		thread.pool_add_task(&pool, mem.nil_allocator(), task_handler, task_data, index)
+		thread.pool_add_task(&global_pool, mem.nil_allocator(), task_handler, task_data, index)
 	}
 
-	thread.pool_finish(&pool)
-	delete(tasks)
-	thread.pool_destroy(&pool)
+	sync.wait_group_wait(&wg)
+	global_thread_pool_clear_done()
 }
 
 @(private)
 WIDTH :: #config(WIDTH, 16)
+@(private)
+THREADS :: #config(THREADS, -1)
+@(private)
+THREAD_MULT :: 2
 
 @(private)
 horizontal_sum :: proc(v: #simd[WIDTH]f32) -> (s: f32) {
@@ -270,7 +280,7 @@ naive_force_soa_simd :: proc(particles: #soa[]Particle, g: f32 = G, eps: f32 = E
 			temp_particles = temp_particles[WIDTH:]
 		}
 
-		if len(particles) > 0 {
+		if len(temp_particles) > 0 {
 			index := iota(#simd[WIDTH]i32)
 			mask := simd.lanes_lt(index, cast(#simd[WIDTH]i32)len(temp_particles))
 			process_force_chunk(
@@ -296,25 +306,25 @@ naive_force_soa_simd :: proc(particles: #soa[]Particle, g: f32 = G, eps: f32 = E
 
 naive_force_soa_simd_threaded :: proc(
 	particles: #soa[]Particle,
-	threads := 8,
 	g: f32 = G,
 	eps: f32 = EPS,
 	allocator := context.allocator,
 ) {
-	pool: thread.Pool
-	thread.pool_init(&pool, allocator, threads)
-	thread.pool_start(&pool)
-
 	TaskData :: struct {
 		proc_particles: #soa[]Particle,
 		all_particles:  #soa[]Particle,
 		g, eps:         f32,
+		wg:             ^sync.Wait_Group,
 	}
 
-	tasks := make([]TaskData, threads, allocator)
+	n_tasks := min(len(global_pool.threads) * THREAD_MULT, len(particles) / WIDTH)
+	tasks := make([]TaskData, n_tasks, allocator)
+	defer delete(tasks)
 
 	task_handler :: proc(task: thread.Task) {
+		index := iota(#simd[WIDTH]i32)
 		data := cast(^TaskData)task.data
+		defer sync.wait_group_done(data.wg)
 		for &p_i in data.proc_particles {
 			temp_particles := data.all_particles
 
@@ -337,7 +347,6 @@ naive_force_soa_simd_threaded :: proc(
 			}
 
 			if len(temp_particles) > 0 {
-				index := iota(#simd[WIDTH]i32)
 				mask := simd.lanes_lt(index, cast(#simd[WIDTH]i32)len(temp_particles))
 				process_force_chunk(
 					temp_particles,
@@ -360,9 +369,12 @@ naive_force_soa_simd_threaded :: proc(
 		}
 	}
 
-	n_per_task := len(particles) / threads + 1
+	n_per_task := len(particles) / n_tasks + 1
 
-	for index in 0 ..< threads {
+	wg: sync.Wait_Group
+	sync.wait_group_add(&wg, n_tasks)
+
+	for index in 0 ..< n_tasks {
 		task_data := &tasks[index]
 		start := index * n_per_task
 		stop := min(len(particles), (index + 1) * n_per_task)
@@ -370,15 +382,13 @@ naive_force_soa_simd_threaded :: proc(
 		task_data.all_particles = particles
 		task_data.g = g
 		task_data.eps = eps
+		task_data.wg = &wg
 
-		thread.pool_add_task(&pool, mem.nil_allocator(), task_handler, task_data, index)
+		thread.pool_add_task(&global_pool, mem.nil_allocator(), task_handler, task_data, index)
 	}
 
-	thread.pool_finish(&pool)
-	delete(tasks)
-	thread.pool_destroy(&pool)
-	for i in 0 ..< len(particles) {
-	}
+	sync.wait_group_wait(&wg)
+	global_thread_pool_clear_done()
 }
 
 update_particles :: proc(particles: []Particle, dt: f32) {
@@ -412,22 +422,21 @@ update_particles_soa :: proc(particles: []Particle, dt: f32) {
 update_particles_soa_threaded :: proc(
 	particles: #soa[]Particle,
 	dt: f32,
-	threads := 8,
 	allocator := context.allocator,
 ) {
-	pool: thread.Pool
-	thread.pool_init(&pool, allocator, threads)
-	thread.pool_start(&pool)
-
 	TaskData :: struct {
 		particles: #soa[]Particle,
 		dt:        f32,
+		wg:        ^sync.Wait_Group,
 	}
 
-	tasks := make([]TaskData, threads, allocator)
+	n_tasks := min(len(global_pool.threads) * THREAD_MULT, len(particles) / WIDTH)
+	tasks := make([]TaskData, n_tasks, allocator)
+	defer delete(tasks)
 
 	task_handler :: proc(task: thread.Task) {
 		data := cast(^TaskData)task.data
+		defer sync.wait_group_done(data.wg)
 		particles := data.particles
 		dt := data.dt
 		for &p in particles {
@@ -443,27 +452,29 @@ update_particles_soa_threaded :: proc(
 		}
 	}
 
-	n_per_task := len(particles) / threads + 1
+	n_per_task := len(particles) / n_tasks + 1
 
-	for index in 0 ..< threads {
+	wg: sync.Wait_Group
+	sync.wait_group_add(&wg, n_tasks)
+
+	for index in 0 ..< n_tasks {
 		task_data := &tasks[index]
 		start := index * n_per_task
 		stop := min(len(particles), (index + 1) * n_per_task)
 		task_data.particles = particles[start:stop]
 		task_data.dt = dt
+		task_data.wg = &wg
 
-		thread.pool_add_task(&pool, mem.nil_allocator(), task_handler, task_data, index)
+		thread.pool_add_task(&global_pool, mem.nil_allocator(), task_handler, task_data, index)
 	}
 
-	thread.pool_finish(&pool)
-	delete(tasks)
-	thread.pool_destroy(&pool)
+	sync.wait_group_wait(&wg)
+	global_thread_pool_clear_done()
 }
 
 update_particles_soa_simd :: proc(
 	particles: #soa[]Particle,
 	dt: f32,
-	threads := 8,
 	allocator := context.allocator,
 ) {
 	particles := particles
@@ -482,22 +493,21 @@ update_particles_soa_simd :: proc(
 update_particles_soa_simd_threaded :: proc(
 	particles: #soa[]Particle,
 	dt: f32,
-	threads := 8,
 	allocator := context.allocator,
 ) {
-	pool: thread.Pool
-	thread.pool_init(&pool, allocator, threads)
-	thread.pool_start(&pool)
-
 	TaskData :: struct {
 		particles: #soa[]Particle,
 		dt:        f32,
+		wg:        ^sync.Wait_Group,
 	}
 
-	tasks := make([]TaskData, threads, allocator)
+	n_tasks := min(len(global_pool.threads) * THREAD_MULT, len(particles) / WIDTH)
+	tasks := make([]TaskData, n_tasks, allocator)
+	defer delete(tasks)
 
 	task_handler :: proc(task: thread.Task) {
 		data := cast(^TaskData)task.data
+		defer sync.wait_group_done(data.wg)
 		particles := data.particles
 		dt := data.dt
 
@@ -513,23 +523,24 @@ update_particles_soa_simd_threaded :: proc(
 		}
 	}
 
-	chunks := len(particles) / WIDTH + 1
-	chunks_per_task := chunks / threads + 1
-	n_per_task := chunks_per_task * WIDTH
+	n_per_task := len(particles) / n_tasks + 1
 
-	for index in 0 ..< threads {
+	wg: sync.Wait_Group
+	sync.wait_group_add(&wg, n_tasks)
+
+	for index in 0 ..< n_tasks {
 		task_data := &tasks[index]
 		start := index * n_per_task
 		stop := min(len(particles), (index + 1) * n_per_task)
 		task_data.particles = particles[start:stop]
 		task_data.dt = dt
+		task_data.wg = &wg
 
-		thread.pool_add_task(&pool, mem.nil_allocator(), task_handler, task_data, index)
+		thread.pool_add_task(&global_pool, mem.nil_allocator(), task_handler, task_data, index)
 	}
 
-	thread.pool_finish(&pool)
-	delete(tasks)
-	thread.pool_destroy(&pool)
+	sync.wait_group_wait(&wg)
+	global_thread_pool_clear_done()
 }
 
 @(private)
@@ -587,7 +598,7 @@ compare_force_results :: proc(aos: []Particle, soa: #soa[]Particle, label: strin
 
 @(private)
 compare_update_results :: proc(aos: []Particle, soa: #soa[]Particle, label: string) {
-	EPSILON :: 1e-3
+	EPSILON :: 1e-8
 
 	for i in 0 ..< len(aos) {
 		dpx := math.abs(aos[i].px - soa.px[i])
@@ -630,8 +641,33 @@ N :: 5000
 @(private)
 ITERATIONS :: 100
 
+global_pool: thread.Pool
+
+init_global_thread_pool :: proc(num_threads: int) {
+	thread.pool_init(&global_pool, context.allocator, num_threads)
+	thread.pool_start(&global_pool)
+}
+
+global_thread_pool_clear_done :: proc() {
+	for {
+		if _, ok := thread.pool_pop_done(&global_pool); !ok do return
+	}
+}
+
+shutdown_global_thread_pool :: proc() {
+	global_thread_pool_clear_done()
+	thread.pool_finish(&global_pool)
+	thread.pool_destroy(&global_pool)
+}
+
+
 @(private)
 main :: proc() {
+	threads := THREADS
+	if threads == -1 do _, threads, _ = info.cpu_core_count()
+	init_global_thread_pool(threads)
+	defer shutdown_global_thread_pool()
+
 	validate()
 	benchmark()
 	find_crossover()
@@ -681,7 +717,7 @@ validate :: proc() {
 	compare_force_results(gold_aos, test_soa, "Naive SOA")
 
 	mem.zero_explicit(rawptr(&test_soa.ax[:][0]), size_of(f32) * N * 3)
-	naive_force_soa_threaded(test_soa, 8)
+	naive_force_soa_threaded(test_soa)
 	compare_force_results(gold_aos, test_soa, "Threaded SOA")
 
 	mem.zero_explicit(rawptr(&test_soa.ax[:][0]), size_of(f32) * N * 3)
@@ -689,7 +725,7 @@ validate :: proc() {
 	compare_force_results(gold_aos, test_soa, "SIMD SOA")
 
 	mem.zero_explicit(rawptr(&test_soa.ax[:][0]), size_of(f32) * N * 3)
-	naive_force_soa_simd_threaded(test_soa, 8)
+	naive_force_soa_simd_threaded(test_soa)
 	compare_force_results(gold_aos, test_soa, "Threaded SIMD SOA")
 
 	delete(gold_aos)
@@ -716,7 +752,7 @@ validate :: proc() {
 	}
 
 	reset_update_test_soa(test_soa_up, particles_soa_base)
-	update_particles_soa_threaded(test_soa_up, DT, 8)
+	update_particles_soa_threaded(test_soa_up, DT)
 	compare_update_results(gold_aos_up, test_soa_up, "Threaded SOA Update")
 
 	reset_update_test_soa(test_soa_up, particles_soa_base)
@@ -724,7 +760,7 @@ validate :: proc() {
 	compare_update_results(gold_aos_up, test_soa_up, "SIMD SOA Update")
 
 	reset_update_test_soa(test_soa_up, particles_soa_base)
-	update_particles_soa_simd_threaded(test_soa_up, DT, 8)
+	update_particles_soa_simd_threaded(test_soa_up, DT)
 	compare_update_results(gold_aos_up, test_soa_up, "Threaded SIMD SOA Update")
 
 	delete(gold_aos_up)
@@ -781,7 +817,7 @@ benchmark :: proc() {
 	mean_t, min_t, max_t = timeit(time_naive_force_soa_simd_threaded, ITERATIONS)
 	fmt.printfln("Avg: %0.2fms -- Min: %0.2fms -- Max: %0.2fms", mean_t, min_t, max_t)
 
-	fmt.println("--- Benchmarking Update Implementations ---")
+	fmt.println("\n--- Benchmarking Update Implementations ---")
 
 	time_update_particles :: proc() {
 		particles := make([]Particle, N)
@@ -795,7 +831,7 @@ benchmark :: proc() {
 	time_update_particles_soa_threaded :: proc() {
 		particles := make(#soa[]Particle, N)
 		defer delete(particles)
-		update_particles_soa_threaded(particles[:], 0.01, 8)
+		update_particles_soa_threaded(particles[:], 0.01)
 	}
 	fmt.printfln("\nThreaded SOA Update -- O(n):")
 	mean_t, min_t, max_t = timeit(time_update_particles_soa_threaded, ITERATIONS)
@@ -813,7 +849,7 @@ benchmark :: proc() {
 	time_update_particles_soa_simd_threaded :: proc() {
 		particles := make(#soa[]Particle, N)
 		defer delete(particles)
-		update_particles_soa_simd_threaded(particles[:], 0.01, 8)
+		update_particles_soa_simd_threaded(particles[:], 0.01)
 	}
 	fmt.printfln("\nThreaded SIMD SOA Update -- O(n):")
 	mean_t, min_t, max_t = timeit(time_update_particles_soa_simd_threaded, ITERATIONS)
@@ -876,7 +912,7 @@ find_crossover :: proc() {
 		t_threaded := 0.0
 		for _ in 0 ..< 50 {
 			now := time.now()
-			update_particles_soa_simd_threaded(particles, 0.01, 8)
+			update_particles_soa_simd_threaded(particles, 0.01)
 			t_threaded += time.duration_milliseconds(time.since(now))
 		}
 		t_threaded /= 50.0
