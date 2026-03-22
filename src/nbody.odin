@@ -1,16 +1,11 @@
 package nbody
 
 import "base:runtime"
-import "core:fmt"
 import "core:math"
-import "core:math/linalg"
-import "core:math/rand"
 import "core:mem"
 import "core:simd"
 import "core:sync"
-import "core:sys/info"
 import "core:thread"
-import "core:time"
 
 
 G :: 1000
@@ -46,9 +41,8 @@ calculate_force :: #force_inline proc(
 
 naive_force :: proc(particles: []Particle, g: f32 = G, eps: f32 = EPS) {
 	n := len(particles)
-	for &a, i in particles {
-		for &b, j in particles {
-			if i == j do continue
+	for &a, i in particles[:n - 1] {
+		for &b in particles[i + 1:] {
 			fx, fy, fz := calculate_force(
 				a.mass,
 				b.mass,
@@ -64,31 +58,103 @@ naive_force :: proc(particles: []Particle, g: f32 = G, eps: f32 = EPS) {
 			a.ax += fx
 			a.ay += fy
 			a.az += fz
+			b.ax -= fx
+			b.ay -= fy
+			b.az -= fz
 		}
 	}
 }
 
 naive_force_soa :: proc(particles: #soa[]Particle, g: f32 = G, eps: f32 = EPS) {
-	for i in 0 ..< len(particles) {
-		for j in 0 ..< len(particles) {
-			if i == j do continue
+	n := len(particles)
+	for &a, i in particles[:n - 1] {
+		for &b in particles[i + 1:] {
 			fx, fy, fz := calculate_force(
-				particles.mass[i],
-				particles.mass[j],
-				particles.px[i],
-				particles.py[i],
-				particles.pz[i],
-				particles.px[j],
-				particles.py[j],
-				particles.pz[j],
+				a.mass,
+				b.mass,
+				a.px,
+				a.py,
+				a.pz,
+				b.px,
+				b.py,
+				b.pz,
 				g,
 				eps,
 			)
-			particles.ax[:][i] += fx
-			particles.ay[:][i] += fy
-			particles.az[:][i] += fz
+			a.ax += fx
+			a.ay += fy
+			a.az += fz
+			b.ax -= fx
+			b.ay -= fy
+			b.az -= fz
 		}
 	}
+}
+
+naive_force_threaded :: proc(
+	particles: []Particle,
+	g: f32 = G,
+	eps: f32 = EPS,
+	allocator := context.allocator,
+) {
+	TaskData :: struct {
+		particles:   []Particle,
+		start, stop: int,
+		g, eps:      f32,
+		wg:          ^sync.Wait_Group,
+	}
+
+	n_tasks := min(len(global_pool.threads) * THREAD_MULT, len(particles) / WIDTH)
+	tasks := make([]TaskData, n_tasks, allocator)
+	defer delete(tasks)
+
+	task_handler :: proc(task: thread.Task) {
+		data := cast(^TaskData)task.data
+		defer sync.wait_group_done(data.wg)
+
+		particles := data.particles
+		stop := min(data.stop, len(particles))
+		for i in data.start ..< stop {
+			for j in 0 ..< len(particles) {
+				if i == j do continue
+				fx, fy, fz := calculate_force(
+					particles[i].mass,
+					particles[j].mass,
+					particles[i].px,
+					particles[i].py,
+					particles[i].pz,
+					particles[j].px,
+					particles[j].py,
+					particles[j].pz,
+					data.g,
+					data.eps,
+				)
+				particles[i].ax += fx
+				particles[i].ay += fy
+				particles[i].az += fz
+			}
+		}
+	}
+
+	n_per_task := len(particles) / n_tasks + 1
+
+	wg: sync.Wait_Group
+	sync.wait_group_add(&wg, n_tasks)
+
+	for index in 0 ..< n_tasks {
+		task_data := &tasks[index]
+		task_data.particles = particles
+		task_data.start = index * n_per_task
+		task_data.stop = (index + 1) * n_per_task
+		task_data.g = g
+		task_data.eps = eps
+		task_data.wg = &wg
+
+		thread.pool_add_task(&global_pool, mem.nil_allocator(), task_handler, task_data, index)
+	}
+
+	sync.wait_group_wait(&wg)
+	global_thread_pool_clear_done()
 }
 
 naive_force_soa_threaded :: proc(
@@ -405,7 +471,7 @@ update_particles :: proc(particles: []Particle, dt: f32) {
 	}
 }
 
-update_particles_soa :: proc(particles: []Particle, dt: f32) {
+update_particles_soa :: proc(particles: #soa[]Particle, dt: f32) {
 	for &p in particles {
 		p.vx += p.ax * dt / p.mass
 		p.vy += p.ay * dt / p.mass
@@ -543,110 +609,6 @@ update_particles_soa_simd_threaded :: proc(
 	global_thread_pool_clear_done()
 }
 
-@(private)
-timeit :: proc(
-	to_time: proc(),
-	iterations := 100,
-	warmup_iterations := 5,
-) -> (
-	mean_t, min_t, max_t: f64,
-) {
-	for _ in 0 ..< warmup_iterations {
-		to_time()
-	}
-
-	min_t = max(f64)
-
-	for i in 0 ..< iterations {
-		now := time.now()
-		to_time()
-		t := time.duration_milliseconds(time.since(now))
-
-		min_t = min(min_t, t)
-		max_t = max(max_t, t)
-		mean_t += t
-	}
-
-	return mean_t / f64(iterations), min_t, max_t
-}
-
-@(private)
-EPSILON :: 1e-1
-@(private)
-compare_force_results :: proc(
-	aos: []Particle,
-	soa: #soa[]Particle,
-	label: string,
-	epsilon: f32 = EPSILON,
-) {
-
-	for i in 0 ..< len(aos) {
-		dx := math.abs(aos[i].ax - soa.ax[i])
-		dy := math.abs(aos[i].ay - soa.ay[i])
-		dz := math.abs(aos[i].az - soa.az[i])
-
-		if dx > epsilon || dy > epsilon || dz > epsilon {
-			fmt.panicf(
-				"Validation failed for %s at index %d!\n  AOS: [%f, %f, %f]\n  SOA: [%f, %f, %f]",
-				label,
-				i,
-				aos[i].ax,
-				aos[i].ay,
-				aos[i].az,
-				soa.ax[i],
-				soa.ay[i],
-				soa.az[i],
-			)
-		}
-	}
-	fmt.printfln(" - %s results match Naive AOS with tolerance %f.", label, epsilon)
-}
-
-@(private)
-compare_update_results :: proc(aos: []Particle, soa: #soa[]Particle, label: string) {
-	EPSILON :: 1e-8
-
-	for i in 0 ..< len(aos) {
-		dpx := math.abs(aos[i].px - soa.px[i])
-		dpy := math.abs(aos[i].py - soa.py[i])
-		dpz := math.abs(aos[i].pz - soa.pz[i])
-		dvx := math.abs(aos[i].vx - soa.vx[i])
-		dvy := math.abs(aos[i].vy - soa.vy[i])
-		dvz := math.abs(aos[i].vz - soa.vz[i])
-		dax := math.abs(aos[i].ax - soa.ax[i])
-		day := math.abs(aos[i].ay - soa.ay[i])
-		daz := math.abs(aos[i].az - soa.az[i])
-
-		if dpx > EPSILON ||
-		   dpy > EPSILON ||
-		   dpz > EPSILON ||
-		   dvx > EPSILON ||
-		   dvy > EPSILON ||
-		   dvz > EPSILON ||
-		   dax > EPSILON ||
-		   day > EPSILON ||
-		   daz > EPSILON {
-			fmt.panicf(
-				"Update validation failed for %s at index %d!\n  AOS Pos: [%f, %f, %f]\n  SOA Pos: [%f, %f, %f]",
-				label,
-				i,
-				aos[i].px,
-				aos[i].py,
-				aos[i].pz,
-				soa.px[i],
-				soa.py[i],
-				soa.pz[i],
-			)
-		}
-	}
-	fmt.printfln(" - %s results match Naive AOS with tolerance %f.", label, EPSILON)
-}
-
-@(private)
-N :: 5000
-@(private)
-ITERATIONS :: 100
-
 global_pool: thread.Pool
 
 init_global_thread_pool :: proc(num_threads: int) {
@@ -664,347 +626,4 @@ shutdown_global_thread_pool :: proc() {
 	global_thread_pool_clear_done()
 	thread.pool_finish(&global_pool)
 	thread.pool_destroy(&global_pool)
-}
-
-
-@(private)
-main :: proc() {
-	threads := THREADS
-	if threads == -1 do _, threads, _ = info.cpu_core_count()
-	init_global_thread_pool(threads)
-	defer shutdown_global_thread_pool()
-
-	// validate()
-	benchmark()
-	// find_crossover()
-}
-
-@(private)
-init_aos :: proc(particles: []Particle) {
-	center_mass: f32 = 1000
-	particles[0].mass = center_mass
-
-	for i in 1 ..< N {
-		angle := rand.float32_range(0, linalg.PI * 2)
-		d := rand.float32_range(20, 450)
-		px := math.cos(angle) * d
-		py := math.sin(angle) * d
-
-		particles[i].px, particles[i].py = px, py
-
-		dir := linalg.normalize([2]f32{-py, px})
-		speed := math.sqrt((G * center_mass) / d)
-
-		particles[i].vx, particles[i].vy = dir.x * speed, dir.y * speed
-		particles[i].mass = 1
-	}
-}
-
-@(private)
-init_soa :: proc(particles: #soa[]Particle) {
-	center_mass: f32 = 1000
-	particles.mass[:][0] = center_mass
-
-	for i in 1 ..< N {
-		angle := rand.float32_range(0, linalg.PI * 2)
-		d := rand.float32_range(20, 450)
-		px := math.cos(angle) * d
-		py := math.sin(angle) * d
-
-		particles.px[:][i], particles.py[:][i] = px, py
-
-		dir := linalg.normalize([2]f32{-py, px})
-		speed := math.sqrt((G * center_mass) / d)
-
-		particles.vx[:][i], particles.vy[:][i] = dir.x * speed, dir.y * speed
-		particles.mass[:][i] = 1
-	}
-}
-
-@(private)
-init_both :: proc(particles: []Particle, particles_soa: #soa[]Particle) {
-	center_mass: f32 = 1000
-	particles[0].mass = center_mass
-	particles_soa.mass[:][0] = center_mass
-
-	for i in 1 ..< N {
-		angle := rand.float32_range(0, linalg.PI * 2)
-		d := rand.float32_range(20, 450)
-		px := math.cos(angle) * d
-		py := math.sin(angle) * d
-
-		particles[i].px, particles[i].py = px, py
-		particles_soa.px[:][i], particles_soa.py[:][i] = px, py
-
-		dir := linalg.normalize([2]f32{-py, px})
-		speed := math.sqrt((G * center_mass) / d)
-
-		particles[i].vx, particles[i].vy = dir.x * speed, dir.y * speed
-		particles[i].mass = 1
-		particles_soa.vx[:][i], particles_soa.vy[:][i] = dir.x * speed, dir.y * speed
-		particles_soa.mass[:][i] = 1
-	}
-}
-
-validate :: proc() {
-	particles_base := make([]Particle, N)
-	particles_soa_base := make(#soa[]Particle, N)
-	init_both(particles_base, particles_soa_base)
-
-	fmt.println("--- Validating Implementations ---")
-
-	gold_aos := make([]Particle, N)
-	mem.copy(raw_data(gold_aos), raw_data(particles_base), size_of(Particle) * N)
-	naive_force(gold_aos)
-
-	test_soa := make(#soa[]Particle, N)
-	mem.copy(
-		rawptr(&test_soa.px[:][0]),
-		rawptr(&particles_soa_base.px[:][0]),
-		size_of(f32) * N * 10,
-	)
-	naive_force_soa(test_soa)
-	compare_force_results(gold_aos, test_soa, "Naive SOA")
-
-	mem.zero_explicit(rawptr(&test_soa.ax[:][0]), size_of(f32) * N * 3)
-	naive_force_soa_threaded(test_soa)
-	compare_force_results(gold_aos, test_soa, "Threaded SOA")
-
-	mem.zero_explicit(rawptr(&test_soa.ax[:][0]), size_of(f32) * N * 3)
-	naive_force_soa_simd(test_soa)
-	compare_force_results(gold_aos, test_soa, "SIMD SOA")
-
-	mem.zero_explicit(rawptr(&test_soa.ax[:][0]), size_of(f32) * N * 3)
-	naive_force_soa_simd_threaded(test_soa)
-	compare_force_results(gold_aos, test_soa, "Threaded SIMD SOA")
-
-	mem.zero_explicit(rawptr(&test_soa.ax[:][0]), size_of(f32) * N * 3)
-	t: Octree
-	octree_init(&t, &test_soa, {0, 0, 0}, 500)
-	defer octree_destroy(&t)
-	bh_simulate(&t, {0, 0, 0}, 500, 0.0)
-	compare_force_results(gold_aos, test_soa, "Barnes Hut", 1)
-
-	delete(gold_aos)
-	delete(test_soa)
-
-	fmt.println("--- Validating Update Implementations ---")
-	DT :: 0.01
-
-	gold_aos_up := make([]Particle, N)
-	mem.copy(raw_data(gold_aos_up), raw_data(particles_base), size_of(Particle) * N)
-	for i in 0 ..< N {
-		gold_aos_up[i].ax, gold_aos_up[i].ay, gold_aos_up[i].az = 10, 10, 10
-		gold_aos_up[i].mass = 1
-	}
-	update_particles(gold_aos_up, DT)
-
-	test_soa_up := make(#soa[]Particle, N)
-	reset_update_test_soa :: proc(target: #soa[]Particle, base: #soa[]Particle) {
-		mem.copy(rawptr(&target.px[:][0]), rawptr(&base.px[:][0]), size_of(f32) * N * 10)
-		for i in 0 ..< N {
-			target.ax[:][i], target.ay[:][i], target.az[:][i] = 10, 10, 10
-			target.mass[:][i] = 1
-		}
-	}
-
-	reset_update_test_soa(test_soa_up, particles_soa_base)
-	update_particles_soa_threaded(test_soa_up, DT)
-	compare_update_results(gold_aos_up, test_soa_up, "Threaded SOA Update")
-
-	reset_update_test_soa(test_soa_up, particles_soa_base)
-	update_particles_soa_simd(test_soa_up, DT)
-	compare_update_results(gold_aos_up, test_soa_up, "SIMD SOA Update")
-
-	reset_update_test_soa(test_soa_up, particles_soa_base)
-	update_particles_soa_simd_threaded(test_soa_up, DT)
-	compare_update_results(gold_aos_up, test_soa_up, "Threaded SIMD SOA Update")
-
-	delete(gold_aos_up)
-	delete(test_soa_up)
-
-	fmt.println("All validations passed!\n")
-}
-
-benchmark :: proc() {
-	fmt.println("--- Benchmarking Force Implementations ---")
-	fmt.printfln("N-Body computation comparison with %d bodies", N)
-	time_naive_force :: proc() {
-		particles := make([]Particle, N)
-		defer delete(particles)
-		init_aos(particles)
-		naive_force(particles[:])
-	}
-	fmt.printfln("Naive Approach -- O(n):")
-	mean_t, min_t, max_t := timeit(time_naive_force, ITERATIONS)
-	fmt.printfln("Avg: %0.2fms -- Min: %0.2fms -- Max: %0.2fms", mean_t, min_t, max_t)
-
-	time_naive_force_soa :: proc() {
-		particles := make(#soa[]Particle, N)
-		defer delete(particles)
-		init_soa(particles)
-		naive_force_soa(particles[:])
-	}
-	fmt.printfln("\nNaive Approach (SOA) -- O(n):")
-	mean_t, min_t, max_t = timeit(time_naive_force_soa, ITERATIONS)
-	fmt.printfln("Avg: %0.2fms -- Min: %0.2fms -- Max: %0.2fms", mean_t, min_t, max_t)
-
-	time_naive_force_soa_threaded :: proc() {
-		particles := make(#soa[]Particle, N)
-		defer delete(particles)
-		init_soa(particles)
-		naive_force_soa_threaded(particles[:], 8)
-	}
-	fmt.printfln("\nNaive Approach (SOA, threaded) -- O(n):")
-	mean_t, min_t, max_t = timeit(time_naive_force_soa_threaded, ITERATIONS)
-	fmt.printfln("Avg: %0.2fms -- Min: %0.2fms -- Max: %0.2fms", mean_t, min_t, max_t)
-
-	time_naive_force_soa_simd :: proc() {
-		particles := make(#soa[]Particle, N)
-		defer delete(particles)
-		init_soa(particles)
-		naive_force_soa_simd(particles[:])
-	}
-	fmt.printfln("\nNaive Approach (SOA, SIMD) -- O(n):")
-	mean_t, min_t, max_t = timeit(time_naive_force_soa_simd, ITERATIONS)
-	fmt.printfln("Avg: %0.2fms -- Min: %0.2fms -- Max: %0.2fms", mean_t, min_t, max_t)
-
-	time_naive_force_soa_simd_threaded :: proc() {
-		particles := make(#soa[]Particle, N)
-		defer delete(particles)
-		init_soa(particles)
-		naive_force_soa_simd_threaded(particles[:], 8)
-	}
-	fmt.printfln("\nNaive Approach (SOA, SIMD, threaded) -- O(n):")
-	mean_t, min_t, max_t = timeit(time_naive_force_soa_simd_threaded, ITERATIONS)
-	fmt.printfln("Avg: %0.2fms -- Min: %0.2fms -- Max: %0.2fms", mean_t, min_t, max_t)
-
-	time_barnes_hut_force :: proc() {
-		particles := make(#soa[]Particle, N)
-		defer delete(particles)
-		init_soa(particles)
-
-		t: Octree
-		octree_init(&t, &particles, {0, 0, 0}, 500)
-		defer octree_destroy(&t)
-		bh_simulate(&t, {0, 0, 0}, 500, 0.2)
-	}
-	fmt.printfln("\nBarnes Hut:")
-	mean_t, min_t, max_t = timeit(time_barnes_hut_force, ITERATIONS)
-	fmt.printfln("Avg: %0.2fms -- Min: %0.2fms -- Max: %0.2fms", mean_t, min_t, max_t)
-
-	fmt.println("\n--- Benchmarking Update Implementations ---")
-
-	time_update_particles :: proc() {
-		particles := make([]Particle, N)
-		defer delete(particles)
-		update_particles(particles[:], 0.01)
-	}
-	fmt.printfln("Naive Update -- O(n):")
-	mean_t, min_t, max_t = timeit(time_update_particles, ITERATIONS)
-	fmt.printfln("Avg: %0.2fms -- Min: %0.2fms -- Max: %0.2fms", mean_t, min_t, max_t)
-
-	time_update_particles_soa_threaded :: proc() {
-		particles := make(#soa[]Particle, N)
-		defer delete(particles)
-		update_particles_soa_threaded(particles[:], 0.01)
-	}
-	fmt.printfln("\nThreaded SOA Update -- O(n):")
-	mean_t, min_t, max_t = timeit(time_update_particles_soa_threaded, ITERATIONS)
-	fmt.printfln("Avg: %0.2fms -- Min: %0.2fms -- Max: %0.2fms", mean_t, min_t, max_t)
-
-	time_update_particles_soa_simd :: proc() {
-		particles := make(#soa[]Particle, N)
-		defer delete(particles)
-		update_particles_soa_simd(particles[:], 0.01)
-	}
-	fmt.printfln("\nSIMD SOA Update -- O(n):")
-	mean_t, min_t, max_t = timeit(time_update_particles_soa_simd, ITERATIONS)
-	fmt.printfln("Avg: %0.2fms -- Min: %0.2fms -- Max: %0.2fms", mean_t, min_t, max_t)
-
-	time_update_particles_soa_simd_threaded :: proc() {
-		particles := make(#soa[]Particle, N)
-		defer delete(particles)
-		update_particles_soa_simd_threaded(particles[:], 0.01)
-	}
-	fmt.printfln("\nThreaded SIMD SOA Update -- O(n):")
-	mean_t, min_t, max_t = timeit(time_update_particles_soa_simd_threaded, ITERATIONS)
-	fmt.printfln("Avg: %0.2fms -- Min: %0.2fms -- Max: %0.2fms", mean_t, min_t, max_t)
-}
-
-find_crossover :: proc() {
-	fmt.println("\n--- Finding Crossover Points ---")
-
-	// Force Crossover Search
-	fmt.println("Searching for Force Crossover (SIMD vs SIMD Threaded)...")
-	for n := 100; n <= 5000; n += 100 {
-		particles := make(#soa[]Particle, n)
-		for i in 0 ..< n do particles.mass[:][i] = 1.0
-		defer delete(particles)
-
-		t_simd := 0.0
-		for _ in 0 ..< 10 {
-			now := time.now()
-			naive_force_soa_simd(particles)
-			t_simd += time.duration_milliseconds(time.since(now))
-		}
-		t_simd /= 10.0
-
-		t_threaded := 0.0
-		for _ in 0 ..< 10 {
-			now := time.now()
-			naive_force_soa_simd_threaded(particles, 8)
-			t_threaded += time.duration_milliseconds(time.since(now))
-		}
-		t_threaded /= 10.0
-
-		if t_threaded < t_simd {
-			fmt.printfln(
-				" > Force Crossover found at N = %d (SIMD: %0.4fms, Threaded: %0.4fms)",
-				n,
-				t_simd,
-				t_threaded,
-			)
-			break
-		}
-	}
-
-	// Update Crossover Search
-	fmt.println("\nSearching for Update Crossover (SIMD vs SIMD Threaded)...")
-	// Update is O(n), so we need much larger N to overcome thread overhead
-	for n := 10000; n <= 2000000; n += 50000 {
-		particles := make(#soa[]Particle, n)
-		for i in 0 ..< n do particles.mass[:][i] = 1.0
-		defer delete(particles)
-
-		t_simd := 0.0
-		for _ in 0 ..< 50 {
-			now := time.now()
-			update_particles_soa_simd(particles, 0.01)
-			t_simd += time.duration_milliseconds(time.since(now))
-		}
-		t_simd /= 50.0
-
-		t_threaded := 0.0
-		for _ in 0 ..< 50 {
-			now := time.now()
-			update_particles_soa_simd_threaded(particles, 0.01)
-			t_threaded += time.duration_milliseconds(time.since(now))
-		}
-		t_threaded /= 50.0
-
-		if t_threaded < t_simd {
-			fmt.printfln(
-				" > Update Crossover found at N = %d (SIMD: %0.4fms, Threaded: %0.4fms)",
-				n,
-				t_simd,
-				t_threaded,
-			)
-			break
-		}
-
-		if n % 500000 == 0 {
-			fmt.printfln("   ...Checked up to N = %d, Threaded is still slower.", n)
-		}
-	}
 }
