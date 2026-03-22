@@ -571,15 +571,21 @@ timeit :: proc(
 }
 
 @(private)
-compare_force_results :: proc(aos: []Particle, soa: #soa[]Particle, label: string) {
-	EPSILON :: 1e-1
+EPSILON :: 1e-1
+@(private)
+compare_force_results :: proc(
+	aos: []Particle,
+	soa: #soa[]Particle,
+	label: string,
+	epsilon: f32 = EPSILON,
+) {
 
 	for i in 0 ..< len(aos) {
 		dx := math.abs(aos[i].ax - soa.ax[i])
 		dy := math.abs(aos[i].ay - soa.ay[i])
 		dz := math.abs(aos[i].az - soa.az[i])
 
-		if dx > EPSILON || dy > EPSILON || dz > EPSILON {
+		if dx > epsilon || dy > epsilon || dz > epsilon {
 			fmt.panicf(
 				"Validation failed for %s at index %d!\n  AOS: [%f, %f, %f]\n  SOA: [%f, %f, %f]",
 				label,
@@ -593,7 +599,7 @@ compare_force_results :: proc(aos: []Particle, soa: #soa[]Particle, label: strin
 			)
 		}
 	}
-	fmt.printfln(" - %s results match Naive AOS with tolerance %f.", label, EPSILON)
+	fmt.printfln(" - %s results match Naive AOS with tolerance %f.", label, epsilon)
 }
 
 @(private)
@@ -668,20 +674,15 @@ main :: proc() {
 	init_global_thread_pool(threads)
 	defer shutdown_global_thread_pool()
 
-	validate()
+	// validate()
 	benchmark()
-	find_crossover()
+	// find_crossover()
 }
 
-validate :: proc() {
-	particles_base := make([]Particle, N)
-	particles_soa_base := make(#soa[]Particle, N)
-	defer delete(particles_base)
-	defer delete(particles_soa_base)
-
+@(private)
+init_aos :: proc(particles: []Particle) {
 	center_mass: f32 = 1000
-	particles_base[0].mass = center_mass
-	particles_soa_base.mass[:][0] = center_mass
+	particles[0].mass = center_mass
 
 	for i in 1 ..< N {
 		angle := rand.float32_range(0, linalg.PI * 2)
@@ -689,17 +690,66 @@ validate :: proc() {
 		px := math.cos(angle) * d
 		py := math.sin(angle) * d
 
-		particles_base[i].px, particles_base[i].py = px, py
-		particles_soa_base.px[:][i], particles_soa_base.py[:][i] = px, py
+		particles[i].px, particles[i].py = px, py
 
 		dir := linalg.normalize([2]f32{-py, px})
 		speed := math.sqrt((G * center_mass) / d)
 
-		particles_base[i].vx, particles_base[i].vy = dir.x * speed, dir.y * speed
-		particles_base[i].mass = 1
-		particles_soa_base.vx[:][i], particles_soa_base.vy[:][i] = dir.x * speed, dir.y * speed
-		particles_soa_base.mass[:][i] = 1
+		particles[i].vx, particles[i].vy = dir.x * speed, dir.y * speed
+		particles[i].mass = 1
 	}
+}
+
+@(private)
+init_soa :: proc(particles: #soa[]Particle) {
+	center_mass: f32 = 1000
+	particles.mass[:][0] = center_mass
+
+	for i in 1 ..< N {
+		angle := rand.float32_range(0, linalg.PI * 2)
+		d := rand.float32_range(20, 450)
+		px := math.cos(angle) * d
+		py := math.sin(angle) * d
+
+		particles.px[:][i], particles.py[:][i] = px, py
+
+		dir := linalg.normalize([2]f32{-py, px})
+		speed := math.sqrt((G * center_mass) / d)
+
+		particles.vx[:][i], particles.vy[:][i] = dir.x * speed, dir.y * speed
+		particles.mass[:][i] = 1
+	}
+}
+
+@(private)
+init_both :: proc(particles: []Particle, particles_soa: #soa[]Particle) {
+	center_mass: f32 = 1000
+	particles[0].mass = center_mass
+	particles_soa.mass[:][0] = center_mass
+
+	for i in 1 ..< N {
+		angle := rand.float32_range(0, linalg.PI * 2)
+		d := rand.float32_range(20, 450)
+		px := math.cos(angle) * d
+		py := math.sin(angle) * d
+
+		particles[i].px, particles[i].py = px, py
+		particles_soa.px[:][i], particles_soa.py[:][i] = px, py
+
+		dir := linalg.normalize([2]f32{-py, px})
+		speed := math.sqrt((G * center_mass) / d)
+
+		particles[i].vx, particles[i].vy = dir.x * speed, dir.y * speed
+		particles[i].mass = 1
+		particles_soa.vx[:][i], particles_soa.vy[:][i] = dir.x * speed, dir.y * speed
+		particles_soa.mass[:][i] = 1
+	}
+}
+
+validate :: proc() {
+	particles_base := make([]Particle, N)
+	particles_soa_base := make(#soa[]Particle, N)
+	init_both(particles_base, particles_soa_base)
 
 	fmt.println("--- Validating Implementations ---")
 
@@ -727,6 +777,13 @@ validate :: proc() {
 	mem.zero_explicit(rawptr(&test_soa.ax[:][0]), size_of(f32) * N * 3)
 	naive_force_soa_simd_threaded(test_soa)
 	compare_force_results(gold_aos, test_soa, "Threaded SIMD SOA")
+
+	mem.zero_explicit(rawptr(&test_soa.ax[:][0]), size_of(f32) * N * 3)
+	t: Octree
+	octree_init(&t, &test_soa, {0, 0, 0}, 500)
+	defer octree_destroy(&t)
+	bh_simulate(&t, {0, 0, 0}, 500, 0.0)
+	compare_force_results(gold_aos, test_soa, "Barnes Hut", 1)
 
 	delete(gold_aos)
 	delete(test_soa)
@@ -775,6 +832,7 @@ benchmark :: proc() {
 	time_naive_force :: proc() {
 		particles := make([]Particle, N)
 		defer delete(particles)
+		init_aos(particles)
 		naive_force(particles[:])
 	}
 	fmt.printfln("Naive Approach -- O(n):")
@@ -784,6 +842,7 @@ benchmark :: proc() {
 	time_naive_force_soa :: proc() {
 		particles := make(#soa[]Particle, N)
 		defer delete(particles)
+		init_soa(particles)
 		naive_force_soa(particles[:])
 	}
 	fmt.printfln("\nNaive Approach (SOA) -- O(n):")
@@ -793,6 +852,7 @@ benchmark :: proc() {
 	time_naive_force_soa_threaded :: proc() {
 		particles := make(#soa[]Particle, N)
 		defer delete(particles)
+		init_soa(particles)
 		naive_force_soa_threaded(particles[:], 8)
 	}
 	fmt.printfln("\nNaive Approach (SOA, threaded) -- O(n):")
@@ -802,6 +862,7 @@ benchmark :: proc() {
 	time_naive_force_soa_simd :: proc() {
 		particles := make(#soa[]Particle, N)
 		defer delete(particles)
+		init_soa(particles)
 		naive_force_soa_simd(particles[:])
 	}
 	fmt.printfln("\nNaive Approach (SOA, SIMD) -- O(n):")
@@ -811,10 +872,25 @@ benchmark :: proc() {
 	time_naive_force_soa_simd_threaded :: proc() {
 		particles := make(#soa[]Particle, N)
 		defer delete(particles)
+		init_soa(particles)
 		naive_force_soa_simd_threaded(particles[:], 8)
 	}
 	fmt.printfln("\nNaive Approach (SOA, SIMD, threaded) -- O(n):")
 	mean_t, min_t, max_t = timeit(time_naive_force_soa_simd_threaded, ITERATIONS)
+	fmt.printfln("Avg: %0.2fms -- Min: %0.2fms -- Max: %0.2fms", mean_t, min_t, max_t)
+
+	time_barnes_hut_force :: proc() {
+		particles := make(#soa[]Particle, N)
+		defer delete(particles)
+		init_soa(particles)
+
+		t: Octree
+		octree_init(&t, &particles, {0, 0, 0}, 500)
+		defer octree_destroy(&t)
+		bh_simulate(&t, {0, 0, 0}, 500, 0.2)
+	}
+	fmt.printfln("\nBarnes Hut:")
+	mean_t, min_t, max_t = timeit(time_barnes_hut_force, ITERATIONS)
 	fmt.printfln("Avg: %0.2fms -- Min: %0.2fms -- Max: %0.2fms", mean_t, min_t, max_t)
 
 	fmt.println("\n--- Benchmarking Update Implementations ---")
