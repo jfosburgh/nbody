@@ -145,7 +145,7 @@ main :: proc() {
 
 	validate()
 	benchmark()
-	// find_crossover()
+	find_crossover()
 	find_limits()
 }
 
