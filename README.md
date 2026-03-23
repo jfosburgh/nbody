@@ -28,4 +28,4 @@ odin run ./src -o:speed
 - [ ] Compute Shader
 
 ## Dependencies
-The core functionality currently has no third party dependencies, but the basic visualization present in the `main` function relies on having the excellent [Odin implementation by Leonardo Temperanza](https://github.com/LeonardoTemperanza/no_gfx_api/tree/main?tab=readme-ov-file) of a low-level graphics API inspired by the [No Graphics API](https://www.sebastianaaltonen.com/blog/no-graphics-api) blog post by Sebastian Aaltonen available in the `shared` collection. When I get around to implementing GPU compute shader versions of these algorithms, this will likely become a strict dependency.
+The core functionality currently has no third party dependencies, but the basic visualization present in the `main` function relies on having my work in progress game framework/engine [dial](https://github.com/jfosburgh/dial.git)
