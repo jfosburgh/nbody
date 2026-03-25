@@ -104,7 +104,7 @@ naive_force_threaded :: proc(
 		wg:          ^sync.Wait_Group,
 	}
 
-	n_tasks := min(len(global_pool.threads) * THREAD_MULT, len(particles) / WIDTH)
+	n_tasks := len(global_pool.threads) * THREAD_MULT
 	tasks := make([]TaskData, n_tasks, allocator)
 	defer delete(tasks)
 

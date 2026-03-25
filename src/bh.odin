@@ -1,8 +1,10 @@
 package nbody
 
+import "core:thread"
+import "core:sync"
+import "core:mem"
 import "core:container/small_array"
 import "core:fmt"
-import "core:math"
 import "core:math/linalg"
 
 INVALID_NODE :: -1
@@ -233,6 +235,40 @@ bh_accumulte_force :: proc(
 	}
 }
 
+bh_reorder :: proc(t: ^Octree, allocator := context.allocator) {
+	indices := make([]i32, len(t.particles), allocator)
+	defer delete(indices)
+	index := 0
+
+	nodes := small_array.Small_Array(256, i32){}
+	small_array.append(&nodes, 0)
+
+	for small_array.len(nodes) > 0 {
+		node := t.nodes[small_array.pop_back(&nodes)]
+		if node.first_child_idx == INVALID_NODE && node.particle_idx == INVALID_PARTICLE do continue
+		if node.particle_idx != INVALID_PARTICLE {
+			indices[index] = node.particle_idx
+			index += 1
+		}
+
+		for i in 0..<8 {
+			if node.child_mask & (0b1 << uint(i)) == 0 do continue
+			small_array.append(&nodes, node.first_child_idx + i32(i))
+		}
+	}
+
+	assert(index == len(indices), "these should be equal")
+
+	reordered_particles := make(#soa[]Particle, len(t.particles), allocator)
+	defer delete(reordered_particles)
+
+	for index, i in indices {
+		reordered_particles[i] = t.particles[index]
+	}
+
+	mem.copy(rawptr(&t.particles.px[0]), rawptr(&reordered_particles.px[0]), size_of(Particle)*len(t.particles))
+}
+
 bh_simulate :: proc(
 	t: ^Octree,
 	center: [3]f32,
@@ -240,9 +276,67 @@ bh_simulate :: proc(
 	theta: f32,
 	g: f32 = G,
 	eps: f32 = EPS,
+	reorder := true,
 ) {
 	assert(len(t.particles) != 0, "Barnes-Hut tree must have particles to simulate")
 	octree_reset(t, center, half_width)
 	for i in 0 ..< len(t.particles) do octree_insert(t, i32(i))
+	if reorder do bh_reorder(t)
 	for i in 0 ..< len(t.particles) do bh_accumulte_force(t, i32(i), half_width * 2, theta, g, eps)
+}
+
+bh_simulate_threaded :: proc(
+	t: ^Octree,
+	center: [3]f32,
+	half_width: f32,
+	theta: f32,
+	g: f32 = G,
+	eps: f32 = EPS,
+	reorder := true,
+	allocator := context.allocator,
+) {
+	assert(len(t.particles) != 0, "Barnes-Hut tree must have particles to simulate")
+	octree_reset(t, center, half_width)
+	for i in 0 ..< len(t.particles) do octree_insert(t, i32(i))
+	if reorder do bh_reorder(t)
+
+	TaskData :: struct {
+		start, stop: int,
+		t: ^Octree,
+		half_width, theta, g, eps: f32,
+		wg:        ^sync.Wait_Group,
+	}
+
+	n_tasks := len(global_pool.threads) * THREAD_MULT * 4
+	tasks := make([]TaskData, n_tasks, allocator)
+	defer delete(tasks)
+
+	task_handler :: proc(task: thread.Task) {
+		data := cast(^TaskData)task.data
+		defer sync.wait_group_done(data.wg)
+
+		for i in data.start ..< data.stop do bh_accumulte_force(data.t, i32(i), data.half_width * 2, data.theta, data.g, data.eps) 
+	}
+
+	n_per_task := len(t.particles) / n_tasks + 1
+
+	wg: sync.Wait_Group
+	sync.wait_group_add(&wg, n_tasks)
+
+	for index in 0 ..< n_tasks {
+		task_data := &tasks[index]
+		task_data.start = index * n_per_task
+		task_data.stop = min(len(t.particles), (index + 1) * n_per_task)
+		task_data.t = t
+		task_data.half_width = half_width
+		task_data.theta = theta
+		task_data.eps = eps
+		task_data.g = g
+		task_data.wg = &wg
+
+		thread.pool_add_task(&global_pool, mem.nil_allocator(), task_handler, task_data, index)
+	}
+
+	sync.wait_group_wait(&wg)
+	global_thread_pool_clear_done()
 }

@@ -12,7 +12,7 @@ import "core:time"
 timeit :: proc(
 	to_time: proc(),
 	iterations := 100,
-	warmup_iterations := 5,
+	warmup_iterations := 1,
 ) -> (
 	mean_t, min_t, max_t: f64,
 ) {
@@ -136,6 +136,7 @@ compare_update_results :: proc(aos: []Particle, soa: #soa[]Particle, label: stri
 
 N :: 5000
 ITERATIONS :: 100
+THETA :: 0.5
 
 main :: proc() {
 	threads := THREADS
@@ -193,12 +194,12 @@ init_soa :: proc(particles: #soa[]Particle) {
 	}
 }
 
-init_both :: proc(particles: []Particle, particles_soa: #soa[]Particle) {
+init_both :: proc(particles: []Particle, particles_soa: #soa[]Particle, n := N) {
 	center_mass: f32 = 1000
 	particles[0].mass = center_mass
 	particles_soa.mass[:][0] = center_mass
 
-	for i in 1 ..< N {
+	for i in 1 ..< n {
 		px := rand.float32_range(-450, 450)
 		py := rand.float32_range(-450, 450)
 		pz := rand.float32_range(-450, 450)
@@ -261,7 +262,7 @@ validate :: proc() {
 	t: Octree
 	octree_init(&t, &test_soa, {0, 0, 0}, 500)
 	defer octree_destroy(&t)
-	bh_simulate(&t, {0, 0, 0}, 500, 0.0)
+	bh_simulate(&t, {0, 0, 0}, 500, 0.0, reorder=false)
 	compare_force_results(gold_aos, test_soa, "Barnes Hut", 1)
 
 	delete(gold_aos)
@@ -318,11 +319,13 @@ benchmark :: proc() {
 	fmt.println("--- Benchmarking Force Implementations ---")
 	fmt.printfln("N-Body computation comparison with %d bodies", N)
 
+	min_t, max_t, mean_t: f64
+
 	time_naive_force :: proc() {
 		naive_force(g_particles_aos)
 	}
 	fmt.printfln("Naive Approach -- O(n):")
-	mean_t, min_t, max_t := timeit(time_naive_force, ITERATIONS)
+	mean_t, min_t, max_t = timeit(time_naive_force, ITERATIONS)
 	fmt.printfln("Avg: %0.2fms -- Min: %0.2fms -- Max: %0.2fms", mean_t, min_t, max_t)
 
 	time_naive_force_soa :: proc() {
@@ -364,10 +367,30 @@ benchmark :: proc() {
 		t: Octree
 		octree_init(&t, &g_particles_soa, {0, 0, 0}, 500)
 		defer octree_destroy(&t)
-		bh_simulate(&t, {0, 0, 0}, 500, 0.2)
+		bh_simulate(&t, {0, 0, 0}, 500, THETA, reorder = false)
 	}
 	fmt.printfln("\nBarnes Hut:")
 	mean_t, min_t, max_t = timeit(time_barnes_hut_force, ITERATIONS)
+	fmt.printfln("Avg: %0.2fms -- Min: %0.2fms -- Max: %0.2fms", mean_t, min_t, max_t)
+
+	time_barnes_hut_force_with_reordering :: proc() {
+		t: Octree
+		octree_init(&t, &g_particles_soa, {0, 0, 0}, 500)
+		defer octree_destroy(&t)
+		bh_simulate(&t, {0, 0, 0}, 500, THETA, reorder=true)
+	}
+	fmt.printfln("\nBarnes Hut with Reordering:")
+	mean_t, min_t, max_t = timeit(time_barnes_hut_force_with_reordering, ITERATIONS)
+	fmt.printfln("Avg: %0.2fms -- Min: %0.2fms -- Max: %0.2fms", mean_t, min_t, max_t)
+
+	time_barnes_hut_force_with_reordering_and_threading :: proc() {
+		t: Octree
+		octree_init(&t, &g_particles_soa, {0, 0, 0}, 500)
+		defer octree_destroy(&t)
+		bh_simulate_threaded(&t, {0, 0, 0}, 500, THETA, reorder=true)
+	}
+	fmt.printfln("\nBarnes Hut with Reordering and Threading:")
+	mean_t, min_t, max_t = timeit(time_barnes_hut_force_with_reordering_and_threading, ITERATIONS)
 	fmt.printfln("Avg: %0.2fms -- Min: %0.2fms -- Max: %0.2fms", mean_t, min_t, max_t)
 
 	fmt.println("\n--- Benchmarking Update Implementations ---")
@@ -413,7 +436,7 @@ find_limits :: proc() {
 	LIMIT_MAX_N :: 100_000
 	g_particles_aos = make([]Particle, LIMIT_MAX_N)
 	g_particles_soa = make(#soa[]Particle, LIMIT_MAX_N)
-	init_both(g_particles_aos, g_particles_soa)
+	init_both(g_particles_aos, g_particles_soa, LIMIT_MAX_N)
 	defer delete(g_particles_aos)
 	defer delete(g_particles_soa)
 
@@ -531,6 +554,50 @@ find_limits :: proc() {
 			n += step
 		}
 		fmt.printfln("Barnes-Hut Limit: ~%d bodies", n)
+	}
+
+	{
+		n := 100
+		for n <= LIMIT_MAX_N {
+			subset := g_particles_soa[:n]
+			t: Octree
+			octree_init(&t, &subset, {0, 0, 0}, 500)
+			bh_simulate(&t, {0, 0, 0}, 500, 0.2)
+			octree_reset(&t, {0, 0, 0}, 500)
+			avg: f64 = 0
+			for i in 0 ..< 100 {
+				start := time.now()
+				bh_simulate(&t, {0, 0, 0}, 500, 0.2, reorder=true)
+				avg += time.duration_milliseconds(time.since(start))
+				octree_reset(&t, {0, 0, 0}, 500)
+			}
+			octree_destroy(&t)
+			if avg / 100 > TARGET_MS do break
+			n += step
+		}
+		fmt.printfln("Barnes-Hut with Reordering Limit: ~%d bodies", n)
+	}
+
+	{
+		n := 100
+		for n <= LIMIT_MAX_N {
+			subset := g_particles_soa[:n]
+			t: Octree
+			octree_init(&t, &subset, {0, 0, 0}, 500)
+			bh_simulate(&t, {0, 0, 0}, 500, 0.2)
+			octree_reset(&t, {0, 0, 0}, 500)
+			avg: f64 = 0
+			for i in 0 ..< 100 {
+				start := time.now()
+				bh_simulate_threaded(&t, {0, 0, 0}, 500, 0.2, reorder=true)
+				avg += time.duration_milliseconds(time.since(start))
+				octree_reset(&t, {0, 0, 0}, 500)
+			}
+			octree_destroy(&t)
+			if avg / 100 > TARGET_MS do break
+			n += step
+		}
+		fmt.printfln("Barnes-Hut with Reordering and Threaded Limit: ~%d bodies", n)
 	}
 }
 
